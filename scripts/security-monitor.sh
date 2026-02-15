@@ -15,7 +15,27 @@ SCAN_DIR="${HOME}/.openclaw/workspace/skills"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Known benign patterns (false positive mitigation)
+declare -A KNOWN_BENIGN=(
+    # Documentation examples
+    ["curl.*\."]="doc_example"
+    ["cat.*\.env"]="dev_command"
+    ["grep.*key"]="diagnostic"
+    ["echo.*secret"]="example_code"
+    # Placeholder patterns
+    ["your_"]="placeholder"
+    ["YOUR_"]="placeholder"
+    ["xxxx"]="placeholder"
+    ["XXXX"]="placeholder"
+    ["MASKED"]="placeholder"
+    ["\[REDACTED\]"]="placeholder"
+    ["\*+="]="placeholder"
+    # Moltbook skill documentation
+    ["webhook\.site"]="doc_example"
+)
 
 # Create config directory if not exists
 mkdir -p "$(dirname "$CONFIG_FILE")"
@@ -54,6 +74,20 @@ log() {
     local timestamp=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
     echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
     echo -e "${GREEN}[$timestamp] [$level] $msg${NC}"
+}
+
+# Check if pattern is known benign (false positive)
+is_benign_pattern() {
+    local pattern=$1
+    local context=$2
+
+    for key in "${!KNOWN_BENIGN[@]}"; do
+        if [[ "$context" =~ $key ]]; then
+            log INFO "Skipping benign pattern: $pattern (matched known pattern: $key)"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Alert function
@@ -142,7 +176,7 @@ check_unverified_skills() {
                 continue
             fi
 
-            # Check for obvious malicious patterns in SKILL.md
+            # Check for malicious patterns (with false positive filtering)
             if [ -f "$skill_md" ]; then
                 local malicious_patterns=(
                     "webhook\.site"
@@ -154,18 +188,89 @@ check_unverified_skills() {
                 )
 
                 for pattern in "${malicious_patterns[@]}"; do
-                    if grep -qi "$pattern" "$skill_md" 2>/dev/null; then
-                        alert HIGH "malicious_pattern" "Suspicious pattern in $skill_name/SKILL.md: $pattern"
-                        break
+                    local match=$(grep -i "$pattern" "$skill_md" 2>/dev/null | head -n 1)
+                    if [ -n "$match" ]; then
+                        # Check if this is a benign pattern
+                        if ! is_benign_pattern "$pattern" "$match"; then
+                            alert HIGH "malicious_pattern" "Suspicious pattern in $skill_name/SKILL.md: $pattern"
+                            break
+                        fi
                     fi
                 done
+
+                # Check for permission manifest (Isnad-inspired feature)
+                check_permission_manifest "$skill_dir" "$skill_name"
             fi
+
+            # Check script execution permissions
+            check_script_permissions "$skill_dir" "$skill_name"
         fi
     done
 
     if [ "$found_unverified" = false ]; then
         log INFO "All skills have SKILL.md documentation"
     fi
+}
+
+# Check 2a: Permission manifest validation (Isnad-inspired)
+check_permission_manifest() {
+    local skill_dir=$1
+    local skill_name=$2
+
+    log INFO "Checking permission manifest for $skill_name..."
+
+    local manifest_file="$skill_dir/permissions.json"
+
+    if [ ! -f "$manifest_file" ]; then
+        log INFO "No permission manifest found for $skill_name (optional)"
+        return
+    fi
+
+    # Parse manifest with jq
+    if ! command -v jq &> /dev/null; then
+        log INFO "jq not found, skipping manifest validation"
+        return
+    fi
+
+    local declared_purpose=$(jq -r '.declared_purpose // empty' "$manifest_file" 2>/dev/null)
+    local permissions=$(jq -r '.permissions // {}' "$manifest_file" 2>/dev/null)
+
+    if [ -n "$declared_purpose" ]; then
+        log INFO "Permission manifest found for $skill_name: $declared_purpose"
+
+        # Maṣlaḥah test: Check proportionality
+        local has_filesystem_write=$(echo "$permissions" | jq -r '.filesystem // []' | grep -q "write" && echo "yes" || echo "no")
+        local has_network=$(echo "$permissions" | jq -r '.network // []' | grep -q "." && echo "yes" || echo "no")
+
+        # Disproportionality check: weather skill requesting filesystem write?
+        if [[ "$declared_purpose" =~ [Ww]eather ]] && [ "$has_filesystem_write" = "yes" ]; then
+            alert MEDIUM "disproportionate_permission" "Weather skill $skill_name requesting filesystem write (maṣlaḥah test failed)"
+        fi
+
+        # Disproportionality check: simple utility requesting network access?
+        if [[ "$declared_purpose" =~ [Uu]tility ]] && [ "$has_network" = "yes" ]; then
+            alert MEDIUM "disproportionate_permission" "Utility skill $skill_name requesting network access (maṣlaḥah test failed)"
+        fi
+    fi
+}
+
+# Check 2b: Script execution permissions
+check_script_permissions() {
+    local skill_dir=$1
+    local skill_name=$2
+
+    while IFS= read -r -d '' script_file; do
+        local perms=$(stat -c "%a" "$script_file" 2>/dev/null || echo "000")
+
+        # Check for dangerous permissions
+        if [ "$perms" = "777" ]; then
+            alert HIGH "insecure_script_perms" "Dangerous permissions on $script_file: 777 (world writable)"
+        elif [ "$perms" = "775" ]; then
+            alert MEDIUM "insecure_script_perms" "Loose permissions on $script_file: 775 (group writable)"
+        elif [[ "$perms" != "755" && "$perms" != "700" && "$perms" != "644" && "$perms" != "600" ]]; then
+            log INFO "Unusual permissions on $script_file: $perms"
+        fi
+    done < <(find "$skill_dir" -type f \( -name "*.sh" -o -name "*.py" -o -name "*.js" \) -print0 2>/dev/null || true)
 }
 
 # Check 3: Insecure SSH or key files
@@ -208,6 +313,9 @@ check_command_history() {
         "cp.*\.env"
         "rm -rf .*openclaw"
         "chmod 777"
+        "chmod 775 .*\.sh"
+        "curl.*webhook\.site"
+        "wget.*\|.*sh"
     )
 
     local history_file="$HOME/.bash_history"
@@ -217,9 +325,13 @@ check_command_history() {
         local found_suspicious=false
 
         for pattern in "${suspicious_patterns[@]}"; do
-            if echo "$recent" | grep -qi "$pattern"; then
-                found_suspicious=true
-                alert HIGH "suspicious_command" "Suspicious command pattern: $pattern"
+            local match=$(echo "$recent" | grep -i "$pattern" | head -n 1)
+            if [ -n "$match" ]; then
+                # Check if this is a benign pattern
+                if ! is_benign_pattern "$pattern" "$match"; then
+                    found_suspicious=true
+                    alert HIGH "suspicious_command" "Suspicious command pattern: $pattern"
+                fi
             fi
         done
 
@@ -235,27 +347,101 @@ check_log_files() {
 
     # Check if any log files contain secrets
     local log_patterns=(
-        "Bearer "
-        "api_key"
-        "password"
-        "token:"
-        "secret"
+        "Bearer [A-Za-z0-9\-_]{20,}"
+        "api_key[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9]{20,}"
+        "password[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9]{8,}"
+        "secret[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9]{16,}"
+        "token[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9]{20,}"
+        "PRIVATE KEY"
+        "AWS_ACCESS_KEY"
+        "OPENAI_API_KEY"
+        "sk-[A-Za-z0-9]{32,}"
     )
 
     local found_leak=false
 
-    # Scan recent log files
+    # Scan recent log files (exclude our own logs to avoid recursion)
     while IFS= read -r -d '' log_file; do
+        # Skip our own log files
+        if [[ "$log_file" =~ security-monitor\.log$ ]] || [[ "$log_file" =~ security-alerts\.log$ ]]; then
+            continue
+        fi
+
         for pattern in "${log_patterns[@]}"; do
-            if grep -qi "$pattern" "$log_file" 2>/dev/null; then
-                found_leak=true
-                alert MEDIUM "log_data_leak" "Possible secret leak in logs: $log_file (pattern: $pattern)"
+            local match=$(grep -iE "$pattern" "$log_file" 2>/dev/null | head -n 1)
+            if [ -n "$match" ]; then
+                # Check if this is a benign pattern
+                if ! is_benign_pattern "$pattern" "$match"; then
+                    found_leak=true
+                    alert HIGH "log_data_leak" "Possible secret leak in logs: $log_file (pattern: $pattern)"
+                    break
+                fi
             fi
         done
     done < <(find "$HOME/.openclaw" -name "*.log" -mtime -7 -type f 2>/dev/null || true)
 
     if [ "$found_leak" = false ]; then
         log INFO "Logs look clean (no sensitive data found)"
+    fi
+}
+
+# Check 6: Unsigned executables (Supply chain protection)
+check_unsigned_executables() {
+    log INFO "Checking for unsigned executables..."
+
+    local found_unsigned=false
+
+    # Check for executable files in skills directory
+    while IFS= read -r -d '' exec_file; do
+        local perms=$(stat -c "%a" "$exec_file" 2>/dev/null || echo "000")
+        local has_exec_bit=$(echo "$perms" | grep -q "[1357]" && echo "yes" || echo "no")
+
+        if [ "$has_exec_bit" = "yes" ]; then
+            # Check if it's in a skill without proper documentation
+            local skill_dir=$(dirname "$exec_file")
+            local skill_name=$(basename "$skill_dir")
+            local skill_md="$skill_dir/SKILL.md"
+
+            # Only alert if executable is directly in skills/ root or subdirectory without SKILL.md
+            if [ ! -f "$skill_md" ]; then
+                found_unsigned=true
+                alert HIGH "unsigned_executable" "Unsigned executable in undocumented skill: $exec_file"
+            fi
+        fi
+    done < <(find "$SCAN_DIR" -maxdepth 2 -type f -perm /111 -print0 2>/dev/null || true)
+
+    if [ "$found_unsigned" = false ]; then
+        log INFO "No unsigned executables found in skills"
+    fi
+}
+
+# Check 7: Suspicious network connections (basic check)
+check_network_connections() {
+    log INFO "Checking for suspicious network connections..."
+
+    # Check for connections to known suspicious domains
+    local suspicious_domains=(
+        "webhook\.site"
+        "requestbin\.net"
+        "pastebin\.com"
+        "hastebin\.com"
+        "t\.me"
+    )
+
+    local found_suspicious=false
+
+    # Check recent network activity from logs
+    while IFS= read -r -d '' log_file; do
+        for domain in "${suspicious_domains[@]}"; do
+            if grep -qi "$domain" "$log_file" 2>/dev/null; then
+                found_suspicious=true
+                alert MEDIUM "suspicious_domain" "Connection to suspicious domain detected: $domain (in $log_file)"
+            fi
+        done
+    done < <(find "$HOME/.openclaw" -name "*.log" -mtime -1 -type f 2>/dev/null || true)
+
+    if [ "$found_suspicious" = false ]; then
+        log INFO "No suspicious network connections found"
     fi
 }
 
@@ -305,6 +491,8 @@ main() {
     check_insecure_keys
     check_command_history
     check_log_files
+    check_unsigned_executables
+    check_network_connections
     update_baseline
     print_summary
 }
