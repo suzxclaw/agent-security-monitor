@@ -178,25 +178,42 @@ check_unverified_skills() {
 
             # Check for malicious patterns (with false positive filtering)
             if [ -f "$skill_md" ]; then
-                local malicious_patterns=(
-                    "webhook\.site"
-                    "curl.*\."
-                    "eval("
-                    "system("
-                    "import os"
-                    "exec.*os"
-                )
+                # Load benign skills list from config (skills to skip pattern checking)
+                local benign_skills
+                benign_skills=$(jq -r '.baseline.benign_skills[] // empty' "$CONFIG_FILE" 2>/dev/null || true)
 
-                for pattern in "${malicious_patterns[@]}"; do
-                    local match=$(grep -i "$pattern" "$skill_md" 2>/dev/null | head -n 1)
-                    if [ -n "$match" ]; then
-                        # Check if this is a benign pattern
-                        if ! is_benign_pattern "$pattern" "$match"; then
-                            alert HIGH "malicious_pattern" "Suspicious pattern in $skill_name/SKILL.md: $pattern"
-                            break
-                        fi
+                # Check if this skill is in the benign list
+                local is_benign_skill=false
+                while IFS= read -r benign; do
+                    if [[ -n "$benign" && "$skill_name" == "$benign" ]]; then
+                        is_benign_skill=true
+                        break
                     fi
-                done
+                done <<< "$benign_skills"
+
+                # Only check patterns if not in benign list
+                if [ "$is_benign_skill" = false ]; then
+                    local malicious_patterns=(
+                        "webhook\.site"
+                        "curl.*\."
+                        "eval("
+                        "system("
+                        "import os"
+                        "exec.*os"
+                    )
+
+                    for pattern in "${malicious_patterns[@]}"; do
+                        local match
+                        match=$(grep -i "$pattern" "$skill_md" 2>/dev/null | head -n 1 || true)
+                        if [ -n "$match" ]; then
+                            # Check if this is a benign pattern
+                            if ! is_benign_pattern "$pattern" "$match"; then
+                                alert HIGH "malicious_pattern" "Suspicious pattern in $skill_name/SKILL.md: $pattern"
+                                break
+                            fi
+                        fi
+                    done
+                fi
 
                 # Check for permission manifest (Isnad-inspired feature)
                 check_permission_manifest "$skill_dir" "$skill_name"
